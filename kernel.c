@@ -27,12 +27,21 @@ void putchar(char ch) {
 }
 
 void kernel_main(void) {
+   // 1. 初始化：清空 BSS 區段
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
     
+    // 2. 正常開機訊息
     printf("\n\nHello %s\n", "World!");
     printf("1 + 2 = %d, %x\n", 1 + 2, 0x1234abcd);
     printf("Binary of 5 is: %b\n", 5);
     
+    // ==========================================
+    // 3. 測試 PANIC 功能 (測試完記得註解掉喔！)
+    PANIC("booted!");
+    printf("unreachable here!\n"); // 檢查這行有沒有被印出來
+    // ==========================================
+    
+    // 4. 正常待機迴圈 (現在因為上面 PANIC 了，所以暫時跑不到這裡)
     for (;;) {
         __asm__ __volatile__("wfi");
     }
