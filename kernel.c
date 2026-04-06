@@ -2,6 +2,7 @@
 #include "common.h"
 
 extern char __bss[], __bss_end[], __stack_top[];
+extern char __free_ram[], __free_ram_end[];
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -113,29 +114,43 @@ void handle_trap(struct trap_frame *f) {
 }
 
 
+paddr_t alloc_pages(uint32_t n) {
+    static paddr_t next_paddr = (paddr_t) __free_ram;
+    paddr_t paddr = next_paddr;
+    next_paddr += n * PAGE_SIZE;
+
+    if (next_paddr > (paddr_t) __free_ram_end)
+        PANIC("out of memory");
+
+    memset((void *) paddr, 0, n * PAGE_SIZE);
+    return paddr;
+}
+
 void kernel_main(void) {
     // 1. 初始化：清空 BSS 區段
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
     
-    // ==========================================
-    // 本章新增 1：告訴 CPU 例外處理器在哪裡 (註冊急診室)
+    // 註冊急診室 (保留，以後如果有意外還是要送醫)
     WRITE_CSR(stvec, (uint32_t) kernel_entry); 
-    // ==========================================
 
-    // 2. 正常開機訊息 (保留你之前辛苦寫的測試！)
+    // 2. 正常開機訊息
     printf("\n\nHello %s\n", "World!");
     printf("1 + 2 = %d, %x\n", 1 + 2, 0x1234abcd);
     printf("Binary of 5 is: %b\n", 5);
     
     // ==========================================
-    // 本章新增 2：製造非法指令例外 (取代舊的 PANIC)
-    __asm__ __volatile__("unimp"); // CPU 執行到這裡會出車禍，跳去 handle_trap
+    // 本章最新測試：記憶體分配 (取代掉舊的 unimp 炸彈)
+    paddr_t paddr0 = alloc_pages(2); // 跟系統要 2 頁 (8KB)
+    paddr_t paddr1 = alloc_pages(1); // 跟系統要 1 頁 (4KB)
     
-    // 如果系統有乖乖跳進例外處理器並死在裡面，這行就絕對不會印出來
-    printf("unreachable here!\n"); 
+    printf("alloc_pages test: paddr0=%x\n", paddr0);
+    printf("alloc_pages test: paddr1=%x\n", paddr1);
+    
+    // 測試完畢，主動停機
+    PANIC("booted!");
     // ==========================================
     
-    // 4. 正常待機迴圈
+    // 4. 正常待機迴圈 (現在暫時跑不到這裡)
     for (;;) {
         __asm__ __volatile__("wfi");
     }
