@@ -13,6 +13,9 @@
 #define PROC_UNUSED   0   // Unused process control structure
 #define PROC_RUNNABLE 1   // Runnable process
 
+#define USER_BASE 0x1000000
+#define SSTATUS_SPIE (1 << 5)
+
 // --- 虛擬記憶體與分頁機制相關旗標 ---
 #define SATP_SV32 (1u << 31) // 啟動 Sv32 分頁模式的開關
 #define PAGE_V    (1 << 0)   // "Valid" bit (entry is enabled)
