@@ -2,6 +2,7 @@ ENTRY(boot)
 
 SECTIONS {
     . = 0x80200000;
+    __kernel_base = .; /* 補上這行！宣告核心實體起點的路標 */
 
     .text :{
         KEEP(*(.text.boot));

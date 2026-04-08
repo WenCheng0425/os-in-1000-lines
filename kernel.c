@@ -3,6 +3,7 @@
 
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __free_ram[], __free_ram_end[];
+extern char __kernel_base[]; // 新增：核心程式碼的起始位址
 
 // ==========================================
 // 全域變數區
@@ -54,6 +55,27 @@ paddr_t alloc_pages(uint32_t n) {
 void delay(void) {
     for (int i = 0; i < 30000000; i++)
         __asm__ __volatile__("nop"); // do nothing
+}
+
+// 新增：建立並寫入分頁表 (Page Table) 的對照紀錄
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        // Create the 2nd level page table if it doesn't exist.
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    // Set the 2nd level page table entry to map the physical page.
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
 }
 
 // ==========================================
@@ -131,12 +153,23 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s0
     *--sp = (uint32_t) pc;          // ra
 
+    // 為這個行程配置專屬的分頁表 (VR 眼鏡)
+    // Map kernel pages.
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) {
+        // 恆等映射 (Identity Mapping)：虛擬位址 = 物理位址 (OS的部分內容)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X); 
+    }
+
     // Initialize fields.
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+    proc->page_table = page_table; // 把分頁表指標發配給proc
     return proc;
 }
+
 void yield(void) {
     // Search for a runnable process
     struct process *next = idle_proc;
@@ -152,17 +185,22 @@ void yield(void) {
     if (next == current_proc)
         return;
 
-    // 在切換舞台給 next 之前，先把 next 專屬的「乾淨核心堆疊頂部」位址
-    // 塞進 sscratch 暫存器保險箱裡，以防它等一下上台出意外！
+    struct process *prev = current_proc;
+    current_proc = next;
+
+    // 在切換暫存器之前，先切換「分頁表開關(satp)」與「核心堆疊備用指標(sscratch)」
     __asm__ __volatile__(
-        "csrw sscratch, %[sscratch]\n"
+        "sfence.vma\n"               // 清空寫入管線
+        "csrw satp, %[satp]\n"       // 切換宇宙開關 (戴上新行程的 VR 眼鏡)
+        "sfence.vma\n"               // 清除舊地圖快取 (TLB Flush)
+        "csrw sscratch, %[sscratch]\n" // 準備好這傢伙專屬的急診病床位址
         :
-        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+        // Don't forget the trailing comma!
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
     
     // Context switch
-    struct process *prev = current_proc;
-    current_proc = next;
     switch_context(&prev->sp, &next->sp);
 }
 
@@ -299,14 +337,14 @@ void kernel_main(void) {
     printf("1 + 2 = %d, %x\n", 1 + 2, 0x1234abcd);
     printf("Binary of 5 is: %b\n", 5);
     
-    // 3. 記憶體分配測試 (保留測試，移除 PANIC 才能繼續往下跑)
+    // 3. 記憶體分配測試
     paddr_t paddr0 = alloc_pages(2); // 跟系統要 2 頁 (8KB)
     paddr_t paddr1 = alloc_pages(1); // 跟系統要 1 頁 (4KB)
     printf("alloc_pages test: paddr0=%x\n", paddr0);
     printf("alloc_pages test: paddr1=%x\n", paddr1);
     
     // ==========================================
-    // 4. 多工作業系統測試 (Context Switch)
+    // 4. 多工作業系統測試 (Context Switch & Virtual Memory)
     idle_proc = create_process((uint32_t) NULL);
     idle_proc->pid = 0; // idle
     current_proc = idle_proc;
