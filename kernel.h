@@ -12,6 +12,7 @@
 
 #define PROC_UNUSED   0   // Unused process control structure
 #define PROC_RUNNABLE 1   // Runnable process
+#define PROC_EXITED   2   // Exited process (waiting to be cleaned up)
 
 #define USER_BASE 0x1000000
 #define SSTATUS_SPIE (1 << 5)
@@ -23,6 +24,9 @@
 #define PAGE_W    (1 << 2)   // Writable
 #define PAGE_X    (1 << 3)   // Executable
 #define PAGE_U    (1 << 4)   // User (accessible in user mode)
+
+// --- 例外與中斷相關旗標 ---
+#define SCAUSE_ECALL 8 // RISC-V 規定，從 U-Mode 呼叫 ecall 的代碼就是 8
 
 // --- Process 結構 ---
 struct process {

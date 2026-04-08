@@ -41,6 +41,11 @@ void putchar(char ch) {
     sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
 }
 
+long getchar(void) {
+    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
+    return ret.error;
+}
+
 paddr_t alloc_pages(uint32_t n) {
     static paddr_t next_paddr = (paddr_t) __free_ram;
     paddr_t paddr = next_paddr;
@@ -317,18 +322,56 @@ void kernel_entry(void) {
         "lw s11, 4 * 29(sp)\n"
 
         // 把原本的 sp (案發現場的堆疊指標) 還給 CPU
-        "lw sp,  4 * 30(sp)\n"
+        //"lw sp,  4 * 30(sp)\n"
+        // 1. 先把 sp 往上推回核心堆疊的頂端 (也就是一開始進來還沒扣 4*31 之前的位置)
+        "addi sp, sp, 4 * 31\n"
+        
+        // 2. 完美交換！
+        // 這樣 sp 就會拿回原本暫存的 User SP，
+        // 而 sscratch 則順利收回乾淨的核心堆疊頂端位址，準備迎接下一次 Trap！
+        "csrrw sp, sscratch, sp\n"
         "sret\n"
     );
 }
 
+void handle_syscall(struct trap_frame *f) {
+    switch (f->a3) {
+        case SYS_PUTCHAR:
+            putchar(f->a0);
+            break;
+        case SYS_GETCHAR:
+            while (1) {
+                long ch = getchar();
+                if (ch >= 0) {
+                    f->a0 = ch;
+                    break;
+                }
+
+                yield();
+            }
+            break;      
+        case SYS_EXIT:
+            printf("process %d exited\n", current_proc->pid);
+            current_proc->state = PROC_EXITED;
+            yield();
+            PANIC("unreachable");  
+        default:
+            PANIC("unexpected syscall a3=%x\n", f->a3);
+    }
+}
+
 void handle_trap(struct trap_frame *f) {
     (void)f;
-    uint32_t scause = READ_CSR(scause);
-    uint32_t stval = READ_CSR(stval);
-    uint32_t user_pc = READ_CSR(sepc);
-
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+    uint32_t scause = READ_CSR(scause); // 病因：為什麼會送來急診室？
+    uint32_t stval = READ_CSR(stval);   // 補充資訊：例如引發錯誤的記憶體位址
+    uint32_t user_pc = READ_CSR(sepc);  // 案發現場：出事那一瞬間的程式行號 (PC)
+    if (scause == SCAUSE_ECALL) {
+        handle_syscall(f); // 轉交給專門處理系統呼叫的部門
+        user_pc += 4;      // 把書籤往後推 4 個 Bytes！
+    } else {
+        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+    }
+    WRITE_CSR(sepc, user_pc);
 }
 
 // ==========================================

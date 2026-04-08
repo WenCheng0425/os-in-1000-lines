@@ -27,6 +27,10 @@ typedef uint32_t vaddr_t;
 #define va_end   __builtin_va_end
 #define va_arg   __builtin_va_arg
 
+#define SYS_PUTCHAR 1 // 總機分機號碼：1 號代表印出字元
+#define SYS_GETCHAR 2 // 總機分機號碼：2 號代表讀入字元
+#define SYS_EXIT    3 // 總機分機號碼：3 號代表結束程式
+
 void *memset(void *buf, char c, size_t n);
 void *memcpy(void *dst, const void *src, size_t n);
 char *strcpy(char *dst, const char *src);
