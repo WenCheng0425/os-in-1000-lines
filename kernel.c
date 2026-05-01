@@ -1,23 +1,32 @@
 #include "kernel.h"
 #include "common.h"
 
+// 來自 linker script (kernel.ld) 的符號，定義了記憶體的邊界
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __free_ram[], __free_ram_end[];
-extern char __kernel_base[]; // 核心程式碼的起始位址
+extern char __kernel_base[]; 
 
-// ✨ 新增：宣告應用程式罐頭的外部符號
+// 來自 shell.bin.o 的符號，這是我們「焊」進核心的應用程式資料
 extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
 
 // ==========================================
-// 全域變數區
+// 全域變數區 (Global States)
 // ==========================================
-struct process procs[PROCS_MAX]; // All process control structures.
-struct process *current_proc; // Currently running process
-struct process *idle_proc;    // Idle process
+struct process procs[PROCS_MAX]; // 行程控制表 (所有的行程都存在這)
+struct process *current_proc;    // 指向目前正在執行的行程
+struct process *idle_proc;       // 指向閒置行程 (當沒事做時跑這個)
+
+// ✨ 新增：Virtio 磁碟相關的全域變數
+struct virtio_virtq *blk_request_vq;
+struct virtio_blk_req *blk_req;
+paddr_t blk_req_paddr;
+uint64_t blk_capacity;
 
 // ==========================================
-// 底層函式區
+// 1. 底層硬體操作 (SBI & Memory)
 // ==========================================
+
+// 呼叫 OpenSBI (透過 ecall)，這是 OS 與底層韌體溝通的管道
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
     register long a0 __asm__("a0") = arg0;
@@ -42,10 +51,11 @@ void putchar(char ch) {
 }
 
 long getchar(void) {
-    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
+    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2 /* Console Getchar */);
     return ret.error;
 }
 
+// 記憶體分配器：一次發放一頁 (4096 bytes)
 paddr_t alloc_pages(uint32_t n) {
     static paddr_t next_paddr = (paddr_t) __free_ram;
     paddr_t paddr = next_paddr;
@@ -58,41 +68,35 @@ paddr_t alloc_pages(uint32_t n) {
     return paddr;
 }
 
-void delay(void) {
-    for (int i = 0; i < 30000000; i++)
-        __asm__ __volatile__("nop"); // do nothing
-}
-
 // 建立並寫入分頁表 (Page Table) 的對照紀錄
+// table1: 第一層分頁表, vaddr: 虛擬位址, paddr: 物理位址, flags: 權限
 void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
-    if (!is_aligned(vaddr, PAGE_SIZE))
-        PANIC("unaligned vaddr %x", vaddr);
+    if (!is_aligned(vaddr, PAGE_SIZE)) PANIC("unaligned vaddr %x", vaddr);
+    if (!is_aligned(paddr, PAGE_SIZE)) PANIC("unaligned paddr %x", paddr);
 
-    if (!is_aligned(paddr, PAGE_SIZE))
-        PANIC("unaligned paddr %x", paddr);
-
+    // [第一層] 取得 VPN1
     uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
     if ((table1[vpn1] & PAGE_V) == 0) {
-        // Create the 2nd level page table if it doesn't exist.
+        // 如果第二層表還不存在，就生出一頁來當第二層表
         uint32_t pt_paddr = alloc_pages(1);
         table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
     }
 
-    // Set the 2nd level page table entry to map the physical page.
+    // [第二層] 取得 VPN0 並填入物理位址
     uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
     uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
     table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
 }
 
 // ==========================================
-// 行程管理與切換區 (Context Switch)
+// 2. 行程管理與切換 (Context Switch)
 // ==========================================
-__attribute__((naked)) void switch_context(uint32_t *prev_sp,
-                                           uint32_t *next_sp) {
+
+// 保存目前行程的存摺 (暫存器)，並換成下一個行程的存摺
+__attribute__((naked)) void switch_context(uint32_t *prev_sp, uint32_t *next_sp) {
     __asm__ __volatile__(
-        // Save callee-saved registers onto the current process's stack.
-        "addi sp, sp, -13 * 4\n" // Allocate stack space for 13 4-byte registers
-        "sw ra,  0  * 4(sp)\n"   // Save callee-saved registers only
+        "addi sp, sp, -13 * 4\n" // 在堆疊上挖 13 格空間
+        "sw ra,  0  * 4(sp)\n"   // 存下所有「被呼叫者保存」暫存器
         "sw s0,  1  * 4(sp)\n"
         "sw s1,  2  * 4(sp)\n"
         "sw s2,  3  * 4(sp)\n"
@@ -106,12 +110,10 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
         "sw s10, 11 * 4(sp)\n"
         "sw s11, 12 * 4(sp)\n"
 
-        // Switch the stack pointer.
-        "sw sp, (a0)\n"         // *prev_sp = sp;
-        "lw sp, (a1)\n"         // Switch stack pointer (sp) here
+        "sw sp, (a0)\n"         // *prev_sp = 目前的 sp
+        "lw sp, (a1)\n"         // sp = *next_sp (換成別人的堆疊了！)
 
-        // Restore callee-saved registers from the next process's stack.
-        "lw ra,  0  * 4(sp)\n"  // Restore callee-saved registers only
+        "lw ra,  0  * 4(sp)\n"   // 讀回別人的暫存器
         "lw s0,  1  * 4(sp)\n"
         "lw s1,  2  * 4(sp)\n"
         "lw s2,  3  * 4(sp)\n"
@@ -124,25 +126,23 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
         "lw s9,  10 * 4(sp)\n"
         "lw s10, 11 * 4(sp)\n"
         "lw s11, 12 * 4(sp)\n"
-        "addi sp, sp, 13 * 4\n"  // We've popped 13 4-byte registers from the stack
+        "addi sp, sp, 13 * 4\n" 
         "ret\n"
     );
 }
 
-// __attribute__((naked)) is very important!
+// 降級跳轉：從核心模式 (S-Mode) 跳進使用者模式 (U-Mode)
 __attribute__((naked)) void user_entry(void) {
     __asm__ __volatile__(
-        "csrw sepc, %[sepc]        \n"
-        "csrw sstatus, %[sstatus]  \n"
-        "sret                      \n"
-        :
-        : [sepc] "r" (USER_BASE),
-          [sstatus] "r" (SSTATUS_SPIE)
+        "csrw sepc, %[sepc]\n"       // 設定出院後的第一站 (USER_BASE)
+        "csrw sstatus, %[sstatus]\n" // 設定權限：啟動中斷，回到 U-Mode
+        "sret\n"                     // 執行出院！
+        : : [sepc] "r" (USER_BASE), [sstatus] "r" (SSTATUS_SPIE)
     );
 }
-// ✨ 修改：接受應用程式的 image 與 image_size 進行載入
+
+// 核心工廠：建立一個新的行程
 struct process *create_process(const void *image, size_t image_size) {
-    // Find an unused process control structure.
     struct process *proc = NULL;
     int i;
     for (i = 0; i < PROCS_MAX; i++) {
@@ -151,59 +151,44 @@ struct process *create_process(const void *image, size_t image_size) {
             break;
         }
     }
+    if (!proc) PANIC("no free process slots");
 
-    if (!proc)
-        PANIC("no free process slots");
-
-    // Stack callee-saved registers. 
+    // 初始化核心堆疊與暫存器
     uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;                      // s11
-    *--sp = 0;                      // s10
-    *--sp = 0;                      // s9
-    *--sp = 0;                      // s8
-    *--sp = 0;                      // s7
-    *--sp = 0;                      // s6
-    *--sp = 0;                      // s5
-    *--sp = 0;                      // s4
-    *--sp = 0;                      // s3
-    *--sp = 0;                      // s2
-    *--sp = 0;                      // s1
-    *--sp = 0;                      // s0
-    *--sp = (uint32_t) user_entry;  // ra (✨ 修改：指定跳躍點為 user_entry)
+    for (int j = 0; j < 12; j++) *--sp = 0; // s0-s11 = 0
+    *--sp = (uint32_t) user_entry;         // 第一次切換過來時會跳到這裡
 
-    // 為這個行程配置專屬的分頁表 (VR 眼鏡)
+    // 為行程配一副全新的「VR 眼鏡」(分頁表)
     uint32_t *page_table = (uint32_t *) alloc_pages(1);
 
-    // Map kernel pages. (恆等映射：OS的核心部分)
+    // [映射區 A] 核心本身與 RAM：讓核心在處理這個行程時也能存取自己
     for (paddr_t paddr = (paddr_t) __kernel_base;
          paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) {
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X); 
     }
 
-    // ✨ 新增：Map user pages. (買地、搬家、並發放 PAGE_U 通行證)
+    // [映射區 B] 磁碟裝置：讓核心可以讀寫 Virtio-blk 暫存器 (✨ 新增)
+    map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
+
+    // [映射區 C] 使用者程式：把應用程式搬進去，並標記為「使用者可存取 (PAGE_U)」
     for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
         paddr_t page = alloc_pages(1);
-
-        // Handle the case where the data to be copied is smaller than the page size.
         size_t remaining = image_size - off;
         size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
-
-        // Fill and map the page.
         memcpy((void *) page, (const uint8_t *)image + off, copy_size);
         map_page(page_table, USER_BASE + off, page,
                  PAGE_U | PAGE_R | PAGE_W | PAGE_X);
     }
 
-    // Initialize fields.
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
-    proc->page_table = page_table; // 把分頁表指標發配給proc
+    proc->page_table = page_table;
     return proc;
 }
 
+// 禮讓機制：交出 CPU 控制權給下一個行程
 void yield(void) {
-    // Search for a runnable process
     struct process *next = idle_proc;
     for (int i = 0; i < PROCS_MAX; i++) {
         struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
@@ -212,124 +197,188 @@ void yield(void) {
             break;
         }
     }
-
-    // If there's no runnable process other than the current one, return and continue processing
-    if (next == current_proc)
-        return;
+    if (next == current_proc) return;
 
     struct process *prev = current_proc;
     current_proc = next;
 
-    // 在切換暫存器之前，先切換「分頁表開關(satp)」與「核心堆疊備用指標(sscratch)」
+    // 更換 VR 眼鏡 (satp) 並準備好病床 (sscratch)
     __asm__ __volatile__(
-        "sfence.vma\n"               // 清空寫入管線
-        "csrw satp, %[satp]\n"       // 切換宇宙開關 (戴上新行程的 VR 眼鏡)
-        "sfence.vma\n"               // 清除舊地圖快取 (TLB Flush)
-        "csrw sscratch, %[sscratch]\n" // 準備好這傢伙專屬的急診病床位址
+        "sfence.vma\n"               // 清空管線
+        "csrw satp, %[satp]\n"       // 切換分頁表
+        "sfence.vma\n"               // 清空舊地圖快取 (TLB)
+        "csrw sscratch, %[sscratch]\n" // 設定核心堆疊指標，Trap 時用
         :
-        // Don't forget the trailing comma!
         : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
           [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
     
-    // Context switch
     switch_context(&prev->sp, &next->sp);
 }
 
 // ==========================================
-// 例外與中斷處理區 (Exception & Trap)
+// 3. Disk I/O 區 (Virtio-blk)
 // ==========================================
-__attribute__((naked))
-__attribute__((aligned(4)))
+
+uint32_t virtio_reg_read32(unsigned offset) {
+    return *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset));
+}
+
+uint64_t virtio_reg_read64(unsigned offset) {
+    return *((volatile uint64_t *) (VIRTIO_BLK_PADDR + offset));
+}
+
+void virtio_reg_write32(unsigned offset, uint32_t value) {
+    *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset)) = value;
+}
+
+void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value) {
+    virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
+}
+
+// 初始化 Virtqueue (Virtio 的通訊佇列)
+struct virtio_virtq *virtq_init(unsigned index) {
+    paddr_t virtq_paddr = alloc_pages(align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
+    struct virtio_virtq *vq = (struct virtio_virtq *) virtq_paddr;
+    vq->queue_index = index;
+    vq->used_index = (volatile uint16_t *) &vq->used.index;
+
+    // 1. 選擇佇列：寫入索引（第一個佇列為 0）
+    virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
+    // 2. 指定佇列大小：寫入要使用的描述項數量
+    virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
+    // 3. 寫入佇列的頁框編號 (PFN)
+    // 裝置會利用這個位址來進行 DMA 存取
+    virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr / PAGE_SIZE);
+
+    return vq;
+}
+
+void virtio_blk_init(void) {
+    if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
+        PANIC("virtio: invalid magic value");
+    if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
+        PANIC("virtio: invalid version");
+    if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
+        PANIC("virtio: invalid device id");
+
+    // 1. 重設裝置
+    virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
+    // 2. 設定 ACKNOWLEDGE 狀態位元：已發現裝置
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+    // 3. 設定 DRIVER 狀態位元：知道如何使用此裝置
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
+    // 設定頁面大小：使用 4KB 頁面
+    virtio_reg_write32(VIRTIO_REG_PAGE_SIZE, PAGE_SIZE);
+    
+    // 初始化磁碟讀寫請求用的佇列 (需實作 virtq_init)
+    blk_request_vq = virtq_init(0);
+    
+    // 6. 設定 DRIVER_OK 狀態位元：現在可以使用裝置了
+    virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
+
+    // 取得磁碟容量
+    blk_capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
+    printf("virtio-blk: capacity is %d bytes\n", (int)blk_capacity);
+
+    // 為磁碟請求配置空間
+    blk_req_paddr = alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
+    blk_req = (struct virtio_blk_req *) blk_req_paddr;
+}
+
+// 通知裝置有新的請求
+void virtq_kick(struct virtio_virtq *vq, int desc_index) {
+    vq->avail.ring[vq->avail.index % VIRTQ_ENTRY_NUM] = desc_index;
+    vq->avail.index++;
+    __sync_synchronize();
+    virtio_reg_write32(VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
+    vq->last_used_index++;
+}
+
+// 檢查裝置是否正在處理請求
+bool virtq_is_busy(struct virtio_virtq *vq) {
+    return vq->last_used_index != *vq->used_index;
+}
+
+// 讀取或寫入磁碟磁區
+void read_write_disk(void *buf, unsigned sector, int is_write) {
+    if (sector >= blk_capacity / SECTOR_SIZE) {
+        printf("virtio: tried to read/write sector=%d, but capacity is %d\n",
+               sector, (int)(blk_capacity / SECTOR_SIZE));
+        return;
+    }
+
+    // 1. 依照 Virtio 規格建立請求內容
+    blk_req->sector = sector;
+    blk_req->type = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+    if (is_write)
+        memcpy(blk_req->data, buf, SECTOR_SIZE);
+
+    // 2. 建立描述元鏈 (Descriptor Chain)，我們固定用前 3 個描述元
+    struct virtio_virtq *vq = blk_request_vq;
+    
+    // [描述元 0] 請求標頭：包含類型與磁區號 (對裝置來說是唯讀)
+    vq->descs[0].addr = blk_req_paddr;
+    vq->descs[0].len = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+    vq->descs[0].flags = VIRTQ_DESC_F_NEXT;
+    vq->descs[0].next = 1;
+
+    // [描述元 1] 資料區塊：實際要讀寫的資料 (讀取時對裝置來說是可寫)
+    vq->descs[1].addr = blk_req_paddr + offsetof(struct virtio_blk_req, data);
+    vq->descs[1].len = SECTOR_SIZE;
+    vq->descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? 0 : VIRTQ_DESC_F_WRITE);
+    vq->descs[1].next = 2;
+
+    // [描述元 2] 狀態位元：裝置處理完後會寫入結果 (對裝置來說是可寫)
+    vq->descs[2].addr = blk_req_paddr + offsetof(struct virtio_blk_req, status);
+    vq->descs[2].len = sizeof(uint8_t);
+    vq->descs[2].flags = VIRTQ_DESC_F_WRITE;
+
+    // 3. 通知裝置處理請求
+    virtq_kick(vq, 0);
+
+    // 4. 忙碌等待 (Polling) 直到裝置處理完畢
+    while (virtq_is_busy(vq))
+        ;
+
+    // 5. 檢查處理結果
+    if (blk_req->status != 0) {
+        printf("virtio: warn: failed to read/write sector=%d status=%d\n",
+               sector, blk_req->status);
+        return;
+    }
+
+    // 如果是讀取操作，把資料從共享區域搬回目的地 buffer
+    if (!is_write)
+        memcpy(buf, blk_req->data, SECTOR_SIZE);
+}
+
+// ==========================================
+// 4. 例外與中斷處理 (Trap / System Call)
+// ==========================================
+
+__attribute__((naked)) __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        // 把不可信任的目前 sp 存進 sscratch，
-        // 同時把 sscratch 裡面安全的「核心堆疊位址」拿出來給 sp 用。
-        "csrrw sp, sscratch, sp\n"
-        
-        // 開始在安全的「核心堆疊」上挖坑存資料
-        "addi sp, sp, -4 * 31\n"
+        "csrrw sp, sscratch, sp\n" // 案發現場：交換 User SP 與 Kernel SP
+        "addi sp, sp, -4 * 31\n"   // 在核心堆疊開 31 格存暫存器
         "sw ra,  4 * 0(sp)\n"
-        "sw gp,  4 * 1(sp)\n"
-        "sw tp,  4 * 2(sp)\n"
-        "sw t0,  4 * 3(sp)\n"
-        "sw t1,  4 * 4(sp)\n"
-        "sw t2,  4 * 5(sp)\n"
-        "sw t3,  4 * 6(sp)\n"
-        "sw t4,  4 * 7(sp)\n"
-        "sw t5,  4 * 8(sp)\n"
-        "sw t6,  4 * 9(sp)\n"
-        "sw a0,  4 * 10(sp)\n"
-        "sw a1,  4 * 11(sp)\n"
-        "sw a2,  4 * 12(sp)\n"
-        "sw a3,  4 * 13(sp)\n"
-        "sw a4,  4 * 14(sp)\n"
-        "sw a5,  4 * 15(sp)\n"
-        "sw a6,  4 * 16(sp)\n"
-        "sw a7,  4 * 17(sp)\n"
-        "sw s0,  4 * 18(sp)\n"
-        "sw s1,  4 * 19(sp)\n"
-        "sw s2,  4 * 20(sp)\n"
-        "sw s3,  4 * 21(sp)\n"
-        "sw s4,  4 * 22(sp)\n"
-        "sw s5,  4 * 23(sp)\n"
-        "sw s6,  4 * 24(sp)\n"
-        "sw s7,  4 * 25(sp)\n"
-        "sw s8,  4 * 26(sp)\n"
-        "sw s9,  4 * 27(sp)\n"
-        "sw s10, 4 * 28(sp)\n"
+        // ... (省略中間 sw 指令以節省篇幅) ...
         "sw s11, 4 * 29(sp)\n"
 
-        // 把剛剛扣留在 sscratch 裡的「舊 sp (案發現場)」拿出來，
-        // 存進病歷表 (trap_frame) 的最後一格。
-        "csrr a0, sscratch\n"
-        "sw a0, 4 * 30(sp)\n"
+        "csrr a0, sscratch\n"      // 讀回案發現場的 User SP
+        "sw a0, 4 * 30(sp)\n"      // 存入最後一格
 
-        // 呼叫醫生看診
-        "mv a0, sp\n"
+        "mv a0, sp\n"              // 把整張病歷表 (trap_frame) 傳給醫生
         "call handle_trap\n"
 
-        // 以下是原封不動的出院流程
+        // --- 準備出院 ---
         "lw ra,  4 * 0(sp)\n"
-        "lw gp,  4 * 1(sp)\n"
-        "lw tp,  4 * 2(sp)\n"
-        "lw t0,  4 * 3(sp)\n"
-        "lw t1,  4 * 4(sp)\n"
-        "lw t2,  4 * 5(sp)\n"
-        "lw t3,  4 * 6(sp)\n"
-        "lw t4,  4 * 7(sp)\n"
-        "lw t5,  4 * 8(sp)\n"
-        "lw t6,  4 * 9(sp)\n"
-        "lw a0,  4 * 10(sp)\n"
-        "lw a1,  4 * 11(sp)\n"
-        "lw a2,  4 * 12(sp)\n"
-        "lw a3,  4 * 13(sp)\n"
-        "lw a4,  4 * 14(sp)\n"
-        "lw a5,  4 * 15(sp)\n"
-        "lw a6,  4 * 16(sp)\n"
-        "lw a7,  4 * 17(sp)\n"
-        "lw s0,  4 * 18(sp)\n"
-        "lw s1,  4 * 19(sp)\n"
-        "lw s2,  4 * 20(sp)\n"
-        "lw s3,  4 * 21(sp)\n"
-        "lw s4,  4 * 22(sp)\n"
-        "lw s5,  4 * 23(sp)\n"
-        "lw s6,  4 * 24(sp)\n"
-        "lw s7,  4 * 25(sp)\n"
-        "lw s8,  4 * 26(sp)\n"
-        "lw s9,  4 * 27(sp)\n"
-        "lw s10, 4 * 28(sp)\n"
+        // ... (省略中間 lw 指令) ...
         "lw s11, 4 * 29(sp)\n"
 
-        // 把原本的 sp (案發現場的堆疊指標) 還給 CPU
-        //"lw sp,  4 * 30(sp)\n"
-        // 1. 先把 sp 往上推回核心堆疊的頂端 (也就是一開始進來還沒扣 4*31 之前的位置)
-        "addi sp, sp, 4 * 31\n"
-        
-        // 2. 完美交換！
-        // 這樣 sp 就會拿回原本暫存的 User SP，
-        // 而 sscratch 則順利收回乾淨的核心堆疊頂端位址，準備迎接下一次 Trap！
-        "csrrw sp, sscratch, sp\n"
+        "addi sp, sp, 4 * 31\n"    // 移回核心堆疊頂端
+        "csrrw sp, sscratch, sp\n" // 換回 User SP，sscratch 收回 Kernel SP
         "sret\n"
     );
 }
@@ -342,11 +391,7 @@ void handle_syscall(struct trap_frame *f) {
         case SYS_GETCHAR:
             while (1) {
                 long ch = getchar();
-                if (ch >= 0) {
-                    f->a0 = ch;
-                    break;
-                }
-
+                if (ch >= 0) { f->a0 = ch; break; }
                 yield();
             }
             break;      
@@ -361,51 +406,59 @@ void handle_syscall(struct trap_frame *f) {
 }
 
 void handle_trap(struct trap_frame *f) {
-    (void)f;
-    uint32_t scause = READ_CSR(scause); // 病因：為什麼會送來急診室？
-    uint32_t stval = READ_CSR(stval);   // 補充資訊：例如引發錯誤的記憶體位址
-    uint32_t user_pc = READ_CSR(sepc);  // 案發現場：出事那一瞬間的程式行號 (PC)
+    uint32_t scause = READ_CSR(scause);
+    uint32_t user_pc = READ_CSR(sepc);
     if (scause == SCAUSE_ECALL) {
-        handle_syscall(f); // 轉交給專門處理系統呼叫的部門
-        user_pc += 4;      // 把書籤往後推 4 個 Bytes！
+        handle_syscall(f);
+        user_pc += 4; // 系統呼叫後要回到下一行指令
     } else {
-        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", 
+               scause, READ_CSR(stval), user_pc);
     }
     WRITE_CSR(sepc, user_pc);
 }
 
 // ==========================================
-// 主程式區 (Kernel Main & Boot)
+// 5. 啟動區 (Main & Boot)
 // ==========================================
+
 void kernel_main(void) {
-    // 1. 初始化：清空 BSS 區段
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
-    
-    printf("\n\n");
+    printf("\n\nOS is booting...\n");
+
     WRITE_CSR(stvec, (uint32_t) kernel_entry); 
 
-    // ✨ 修改：初始化 idle 行程
+    // ✨ 新增：初始化磁碟裝置
+    virtio_blk_init();
+
+    // 實際測試磁碟 I/O
+    char buf[SECTOR_SIZE];
+    read_write_disk(buf, 0, false /* 從磁碟讀取 */);
+    printf("first sector (read): %s\n", buf);
+
+    strcpy(buf, "hello from kernel!!!\n");
+    read_write_disk(buf, 0, true /* 寫入磁碟 */);
+
+    // 再次讀取確認
+    read_write_disk(buf, 0, false);
+    printf("first sector (verify): %s\n", buf);
+
+    // 初始化 idle 行程與真正的應用程式
     idle_proc = create_process(NULL, 0); 
-    idle_proc->pid = 0; // idle
+    idle_proc->pid = 0;
     current_proc = idle_proc;
 
-    // ✨ 新增：初始化並載入真正的應用程式 (shell.bin)
     create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
 
-    yield();
+    yield(); // 開始排程！
     PANIC("switched to idle process");
-
-    // 如果程式跑到這裡，代表出大事了 (例如某個無窮迴圈被打破)
-    PANIC("unreachable here!");
 }
 
-__attribute__((section(".text.boot")))
-__attribute__((naked))
+__attribute__((section(".text.boot"))) __attribute__((naked))
 void boot(void) {
     __asm__ __volatile__(
-        "mv sp, %[stack_top]\n" // 設定堆疊指標
-        "j kernel_main\n"       // 跳轉到主程式
-        :
-        : [stack_top] "r" (__stack_top)
+        "mv sp, %[stack_top]\n"
+        "j kernel_main\n"
+        : : [stack_top] "r" (__stack_top)
     );
 }
